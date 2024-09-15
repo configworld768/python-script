@@ -19,6 +19,7 @@ import subprocess
 4、管道符反弹特征：
   文件描述符1（stdout）指向管道。
   文件描述符0和其他可读写文件描述符（如2）指向同一个套接字文件。
+  参考: https://github.com/configworld768/linuxStack/tree/master/reser_shell
 '''
 
 def is_socket(fd_path):
