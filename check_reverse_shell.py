@@ -1,7 +1,8 @@
 #by huowuzhao
 import os
+import psutil
 import stat
-import subprocess
+import socket
 
 '''
 关键检测要点：
@@ -22,105 +23,193 @@ import subprocess
   参考: https://github.com/configworld768/linuxStack/tree/master/reser_shell
 '''
 
+
 def is_socket(fd_path):
-    """ 检查文件描述符是否是Socket类型 """
+    """Check if the file descriptor is a socket."""
     try:
         mode = os.stat(fd_path).st_mode
         return stat.S_ISSOCK(mode)
-    except Exception as e:
+    except Exception:
         return False
 
 def is_pipe(fd_path):
-    """ 检查文件描述符是否是管道类型 """
+    """Check if the file descriptor is a pipe (FIFO)."""
     try:
         mode = os.stat(fd_path).st_mode
         return stat.S_ISFIFO(mode)
-    except Exception as e:
+    except Exception:
         return False
 
-def get_fd_info(pid):
-    """ 获取指定PID的文件描述符信息 """
-    fd_dir = f'/proc/{pid}/fd'
-    fd_info = {}
-
+def get_process_command(pid):
+    """Get the command line of the process."""
     try:
-        for fd in os.listdir(fd_dir):
-            fd_path = os.path.join(fd_dir, fd)
-            if os.path.islink(fd_path):
-                target = os.readlink(fd_path)
-                fd_info[int(fd)] = target
-    except Exception as e:
-        print(f"无法访问进程 {pid} 的文件描述符: {e}")
-        return {}
+        proc = psutil.Process(pid)
+        cmdline = ' '.join(proc.cmdline())
+        return cmdline
+    except Exception:
+        return ""
 
-    return fd_info
+def get_network_connections(pid):
+    """Get network connections of the process."""
+    try:
+        proc = psutil.Process(pid)
+        connections = proc.net_connections(kind='inet')
+        conn_info = []
+        for conn in connections:
+            laddr = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else ''
+            raddr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else ''
+            conn_info.append({
+                'type': 'TCP' if conn.type == socket.SOCK_STREAM else 'UDP',
+                'local_address': laddr,
+                'remote_address': raddr,
+                'status': conn.status
+            })
+        return conn_info
+    except Exception:
+        return []
 
-def check_shell_rebound(pid):
-    """ 检查Shell反弹特征 """
-    fd_info = get_fd_info(pid)
+def check_shell_reverse_shell(pid):
+    """Check for Shell reverse shell features."""
+    # Condition 1: File descriptor 0 is redirected to a socket file
+    fd0_path = f'/proc/{pid}/fd/0'
+    fd1_path = f'/proc/{pid}/fd/1'
+    fd2_path = f'/proc/{pid}/fd/2'
 
-    if all(is_socket(f'/proc/{pid}/fd/{fd}') for fd in [0, 1, 2]):
-        print(f"进程 {pid} 符合Shell反弹特征")
+    cond1 = is_socket(fd0_path)
+    # Condition 2: File descriptors 1 and 2 are redirected to socket files
+    cond2 = is_socket(fd1_path) and is_socket(fd2_path)
+
+    if cond1 and cond2:
         return True
     else:
-        print(f"进程 {pid} 不符合Shell反弹特征")
         return False
 
-def check_socket_rebound(pid):
-    """ 检查Socket反弹特征 """
-    fd_info = get_fd_info(pid)
+def check_socket_reverse_shell(pid):
+    """Check for Socket reverse shell features."""
+    # Condition 1: Generate a socket file descriptor communicating with the outside world,
+    # and it's the smallest available file descriptor (fd 0)
+    fd0_path = f'/proc/{pid}/fd/0'
+    cond1 = is_socket(fd0_path)
 
-    # 检查是否有最小的FD是Socket，且创建了SHELL子进程
-    if all(is_socket(f'/proc/{pid}/fd/{fd}') for fd in [0]):
-        print(f"进程 {pid} 可能具有与外界通信的Socket反弹特征")
-        # 查找子进程是否继承了Socket
-        child_pids = subprocess.check_output(f'pgrep -P {pid}', shell=True).decode().split()
-        for child_pid in child_pids:
-            child_fd_info = get_fd_info(child_pid)
-            if child_fd_info and any(is_socket(f'/proc/{child_pid}/fd/{fd}') for fd in [0, 1, 2]):
-                print(f"子进程 {child_pid} 继承了Socket文件描述符，可能是反弹Shell")
-                return True
-    print(f"进程 {pid} 不符合Socket反弹特征")
-    return False
+    # Condition 2: Has a SHELL subprocess that inherits file descriptors
+    # Find child processes
+    try:
+        proc = psutil.Process(pid)
+        child_procs = proc.children(recursive=True)
+        cond2 = False
+        for child in child_procs:
+            # Check if child is a shell process
+            child_cmd = ' '.join(child.cmdline())
+            if 'sh' in child_cmd or 'bash' in child_cmd or 'zsh' in child_cmd:
+                # Check if child inherits file descriptor 0
+                child_fd0_path = f'/proc/{child.pid}/fd/0'
+                try:
+                    if os.path.samefile(fd0_path, child_fd0_path):
+                        cond2 = True
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        cond2 = False
 
-def check_process_rebound(pid):
-    """ 检查进程反弹特征 """
-    fd_info = get_fd_info(pid)
-
-    if all(is_pipe(f'/proc/{pid}/fd/{fd}') for fd in [0, 1]):
-        print(f"进程 {pid} 符合进程间通信的管道反弹特征")
-        # 检查是否是一个Shell进程
-        cmdline_path = f'/proc/{pid}/cmdline'
-        with open(cmdline_path, 'r') as f:
-            cmdline = f.read()
-            if 'sh' in cmdline or 'bash' in cmdline:
-                print(f"进程 {pid} 是一个Shell进程，且符合反弹特征")
-                return True
-    print(f"进程 {pid} 不符合进程反弹特征")
-    return False
-
-def check_pipe_rebound(pid):
-    """ 检查管道符反弹特征 """
-    fd_info = get_fd_info(pid)
-
-    if is_pipe(f'/proc/{pid}/fd/1') and all(is_socket(f'/proc/{pid}/fd/{fd}') for fd in [0, 2]):
-        print(f"进程 {pid} 符合管道符反弹特征")
+    if cond1 and cond2:
         return True
     else:
-        print(f"进程 {pid} 不符合管道符反弹特征")
         return False
 
-if __name__ == '__main__':
-    pid = input("请输入要检查的进程PID: ")
+def check_process_reverse_shell(pid):
+    """Check for Process reverse shell features."""
+    fd0_path = f'/proc/{pid}/fd/0'
+    fd1_path = f'/proc/{pid}/fd/1'
 
-    print("\n[检测Shell反弹特征]")
-    check_shell_rebound(pid)
+    # Condition 1: File descriptor 0 points to a pipe
+    cond1 = is_pipe(fd0_path)
 
-    print("\n[检测Socket反弹特征]")
-    check_socket_rebound(pid)
+    # Condition 2: File descriptor 1 points to a pipe
+    cond2 = is_pipe(fd1_path)
 
-    print("\n[检测进程反弹特征]")
-    check_process_rebound(pid)
+    # Condition 3: Generate a long-lived SHELL process pointing to the pipe
+    # Check if the process is a shell process
+    try:
+        proc = psutil.Process(pid)
+        cmdline = ' '.join(proc.cmdline())
+        if 'sh' in cmdline or 'bash' in cmdline or 'zsh' in cmdline:
+            cond3 = True
+        else:
+            cond3 = False
+    except Exception:
+        cond3 = False
 
-    print("\n[检测管道符反弹特征]")
-    check_pipe_rebound(pid)
+    if cond1 and cond2 and cond3:
+        return True
+    else:
+        return False
+
+def check_pipe_symbol_reverse_shell(pid):
+    """Check for Pipe symbol reverse shell features."""
+    fd0_path = f'/proc/{pid}/fd/0'
+    fd1_path = f'/proc/{pid}/fd/1'
+    fd2_path = f'/proc/{pid}/fd/2'
+
+    # Condition 1: fd 1 points to a pipe
+    cond1 = is_pipe(fd1_path)
+
+    # Condition 2: fd 0 and other readable/writable fds point to the same socket file
+    cond2 = False
+    if is_socket(fd0_path) and is_socket(fd2_path):
+        try:
+            if os.path.samefile(fd0_path, fd2_path):
+                cond2 = True
+        except Exception:
+            cond2 = False
+
+    if cond1 and cond2:
+        return True
+    else:
+        return False
+
+def main():
+    pid_input = input("请输入要检测的进程 PID：")
+    try:
+        pid = int(pid_input)
+    except ValueError:
+        print("无效的 PID，请输入数字。")
+        return
+
+    if not psutil.pid_exists(pid):
+        print(f"进程 {pid} 不存在。")
+        return
+
+    reverse_shell_detected = False
+
+    if check_shell_reverse_shell(pid):
+        print(f"进程 {pid} 符合 Shell 反弹特征。")
+        reverse_shell_detected = True
+    elif check_socket_reverse_shell(pid):
+        print(f"进程 {pid} 符合 Socket 反弹特征。")
+        reverse_shell_detected = True
+    elif check_process_reverse_shell(pid):
+        print(f"进程 {pid} 符合 进程反弹特征。")
+        reverse_shell_detected = True
+    elif check_pipe_symbol_reverse_shell(pid):
+        print(f"进程 {pid} 符合 管道符反弹特征。")
+        reverse_shell_detected = True
+    else:
+        print(f"进程 {pid} 不符合任何反弹特征。")
+
+    if reverse_shell_detected:
+        # Print command and network connection information
+        cmdline = get_process_command(pid)
+        print(f"命令行: {cmdline}")
+        connections = get_network_connections(pid)
+        if connections:
+            print("网络连接信息：")
+            for conn in connections:
+                print(f"  协议: {conn['type']}, 本地地址: {conn['local_address']}, 远程地址: {conn['remote_address']}, 状态: {conn['status']}")
+        else:
+            print("未找到网络连接信息。")
+    else:
+        print("未检测到反弹 Shell。")
+
+if __name__ == "__main__":
+    main()
